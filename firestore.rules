@@ -1,0 +1,99 @@
+rules_version = '2';
+
+// 매치? 매치! Firestore 보안 규칙
+// - 모든 기기는 익명 로그인 사용
+// - 방을 만든 기기(hostUid)만 진행자 조작 가능
+// - 답안은 자기 그룹 기기만 읽을 수 있고, 진행자 포함 다른 기기는 답 공개(revealed) 뒤에만 읽을 수 있음
+// - 답안 쓰기는 해당 라운드가 선택 중(selecting)일 때만 가능 → 마감 뒤 늦게 도착한 제출은 거부됨
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function roomPath(roomId) { return /databases/$(database)/documents/rooms/$(roomId); }
+    function room(roomId) { return get(roomPath(roomId)).data; }
+    function isHost(roomId) { return signedIn() && room(roomId).hostUid == request.auth.uid; }
+    function validGid(g) { return g in ['T1A', 'T1B', 'T2A', 'T2B', 'T3A', 'T3B', 'T4A', 'T4B']; }
+    function groupPath(roomId, gid) { return /databases/$(database)/documents/rooms/$(roomId)/groups/$(gid); }
+    function ownsGroup(roomId, gid) {
+      return signedIn() && exists(groupPath(roomId, gid)) && get(groupPath(roomId, gid)).data.ownerUid == request.auth.uid;
+    }
+    function roundPhase(roomId, r) {
+      return get(/databases/$(database)/documents/rooms/$(roomId)/rounds/$(r)).data.phase;
+    }
+    function validPick(roomId, list) {
+      return list is list && list.size() == 7 && !('' in list) && list.toSet().size() == 7
+        && room(roomId).photoOrder.hasAll(list);
+    }
+
+    match /rooms/{roomId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.hostUid == request.auth.uid;
+      allow update: if isHost(roomId) && request.resource.data.hostUid == resource.data.hostUid;
+      allow delete: if false;
+
+      // 서버 시각 보정용 (각자 자기 문서만)
+      match /clocks/{uid} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      // 아직 공개하지 않은 라운드 주제 (진행자만)
+      match /private/{docId} {
+        allow read, write: if isHost(roomId);
+      }
+
+      match /photos/{photoId} {
+        allow read: if signedIn();
+        allow write: if isHost(roomId) && room(roomId).currentRound == 0;
+      }
+
+      match /groups/{gid} {
+        allow read: if signedIn();
+        // 빈 그룹 선택
+        allow create: if signedIn() && validGid(gid)
+          && request.resource.data.ownerUid == request.auth.uid
+          && request.resource.data.allowTransfer == false;
+        allow update: if isHost(roomId)
+          // 자기 그룹 접속 표시(하트비트): 소유자·변경 허용 값은 그대로
+          || (signedIn() && resource.data.ownerUid == request.auth.uid
+              && request.resource.data.ownerUid == request.auth.uid
+              && request.resource.data.allowTransfer == resource.data.allowTransfer)
+          // 진행자가 기기 변경을 허용한 그룹 이어받기
+          || (signedIn() && resource.data.allowTransfer == true
+              && request.resource.data.ownerUid == request.auth.uid
+              && request.resource.data.allowTransfer == false);
+        // 진행자, 또는 게임 시작 전에 그룹을 잘못 고른 본인
+        allow delete: if isHost(roomId)
+          || (signedIn() && resource.data.ownerUid == request.auth.uid && room(roomId).currentRound == 0);
+      }
+
+      match /rounds/{r} {
+        allow read: if signedIn();
+        allow write: if isHost(roomId);
+
+        // 제출 여부만 담은 문서 (진행자·빔이 현황 표시에 사용, 답안 내용 없음)
+        match /status/{gid} {
+          allow read: if signedIn();
+          allow create, update: if validGid(gid) && ownsGroup(roomId, gid) && roundPhase(roomId, r) == 'selecting'
+            // 제출 완료 표시는 실제 제출본이 함께 저장될 때만
+            && (request.resource.data.get('submitted', false) == false
+                || getAfter(/databases/$(database)/documents/rooms/$(roomId)/rounds/$(r)/answers/$(gid)).data.get('submitted', null) != null)
+            // 한 번 제출하면 제출 완료 상태는 되돌릴 수 없음 (마지막 제출본 유지)
+            && (resource == null || resource.data.get('submitted', false) == false || request.resource.data.get('submitted', false) == true);
+          allow delete: if false;
+        }
+
+        // 답안 (초안 draft + 마지막 제출본 submitted)
+        match /answers/{gid} {
+          allow get: if ownsGroup(roomId, gid) || roundPhase(roomId, r) == 'revealed';
+          allow list: if false;
+          allow create, update: if validGid(gid) && ownsGroup(roomId, gid) && roundPhase(roomId, r) == 'selecting'
+            && request.resource.data.draft is list && request.resource.data.draft.size() == 7
+            && (request.resource.data.get('submitted', null) == null || validPick(roomId, request.resource.data.submitted))
+            // 제출본을 지우는 것은 불가
+            && (resource == null || resource.data.get('submitted', null) == null || request.resource.data.get('submitted', null) != null);
+          allow delete: if false;
+        }
+      }
+    }
+  }
+}
